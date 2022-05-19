@@ -29,8 +29,8 @@ class ForwardScanner(object):
         return ret
 
     def push(self, sample):
-        assert(self.current is not None)
-        self.outputs.push(self.current, sample)
+        assert(self.current is not None) and (self.scale is not None)
+        self.outputs.push(self.current * self.scale, sample)
         self.current = None
 
     def voxels(self):
@@ -56,11 +56,13 @@ class ForwardScanner(object):
         self.counter        = 0
         self.current        = None
         self.outputs        = None
+        self.scale          = None
 
     def _setup(self):
         self.offset = Vec3d(self.params.get('offset', (0,0,0)))
         self.stride = Vec3d(self.params.get('stride', (0,0,0)))
         self.grid   = Vec3d(self.params.get('grid',   (0,0,0)))
+        self.scale  = Vec3d(self.params.get('scale',  (1,1,1)))
 
         self.vmin = self.dataset.valid_range().min() + self.offset
         self.vmax = self.dataset.valid_range().max()
@@ -137,7 +139,11 @@ class ForwardScanner(object):
 
         # Prepare outputs.
         blend_mode = self.params.get('blend', '')
+        if (self.scale is None) or (self.scale == Vec3d(1,1,1)):
+            locs = self.locs
+        else:
+            locs = [l * self.scale for l in self.locs]
         self.outputs = blend.prepare_outputs(
-            self.scan_spec, self.locs,
+            self.scan_spec, locs,
             blend=overlap, blend_mode=blend_mode
         )
