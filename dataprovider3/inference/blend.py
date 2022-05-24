@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import time
 
@@ -22,7 +23,7 @@ class Blend(object):
     Blend interface.
     """
     def __init__(self, spec, locs, blend=False, precomputed=False):
-        self.spec = dict(spec)
+        self.spec = copy.deepcopy(spec)
         self.locs = list(locs)
         self.blend = blend
         self.precomputed = precomputed
@@ -55,11 +56,11 @@ class Blend(object):
         self.data = dict()
         self.op = None
         for k, v in self.spec.items():
-            dim = v[-3:]
+            dim = v['shape'][-3:]
             a = centered_box(lmin, dim)
             b = centered_box(lmax, dim)
             c = a.merge(b)
-            shape = v[:-3] + tuple(c.size())
+            shape = v['shape'][:-3] + tuple(c.size())
 
             # Inference with overlapping windows
             if self.blend:
@@ -85,7 +86,7 @@ class BumpBlend(Blend):
             # for numerical stability.
             max_logits = dict()
             for k, v in self.data.items():
-                fov = self.spec[k][-3:]
+                fov = self.spec[k]['shape'][-3:]
                 data = np.full(v.dim(), -np.inf, dtype='float32')
                 max_logit = WTD(data, offset=v.offset())
                 max_logit_window = self._bump_logit_map(fov)

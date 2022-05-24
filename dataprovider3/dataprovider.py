@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 
 from .dataset import Dataset
@@ -13,7 +14,7 @@ class DataProvider(object):
         p (list of float): sampling weights.
     """
     def __init__(self, spec):
-        self.spec = dict(spec)
+        self.spec = copy.deepcopy(spec)
         self.datasets = list()
         self.augments = None
         self.p = None

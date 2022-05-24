@@ -11,7 +11,7 @@ class Dataset(object):
     """Dataset for volumetric data.
 
     Attributes:
-        spec (dict): mapping key to tensor's shape.
+        spec (dict): mapping key to dict.
         data (dict): mapping key to TensorData.
         locs (dict): valid locations.
     """
@@ -47,7 +47,7 @@ class Dataset(object):
     def set_spec(self, spec):
         self.spec = None
         if spec is not None:
-            self.spec = dict(spec)
+            self.spec = copy.deepcopy(spec)
 
     def get_patch(self, key, pos, dim):
         """Extract a patch from the data tagged with `key`."""
@@ -59,11 +59,11 @@ class Dataset(object):
         """Extract a sample centered on pos."""
         spec = self._validate(spec)
         sample = dict()
-        for key, dim in spec.items():
-            patch = self.get_patch(key, pos, dim[-3:])
+        for k, v in spec.items():
+            patch = self.get_patch(k, pos, v['shape'][-3:])
             if patch is None:
                 raise Dataset.OutOfRangeError()
-            sample[key] = patch
+            sample[k] = patch
         return utils.sort(sample)
 
     def random_sample(self, spec=None):
@@ -108,7 +108,7 @@ class Dataset(object):
         if spec is None:
             if self.spec is None:
                 raise Dataset.NoSpecError()
-            spec = dict(self.spec)
+            spec = copy.deepcopy(self.spec)
         assert all([k in self.data for k in spec])
         return spec
 
@@ -139,12 +139,12 @@ class Dataset(object):
         of each TensorData.
         """
         valid = None
-        for key, dim in spec.items():
-            assert key in self.data
-            v = self.data[key].valid_range(dim[-3:])
-            if v is None:
+        for k, v in spec.items():
+            assert k in self.data
+            val_range = self.data[k].valid_range(v['shape'][-3:])
+            if val_range is None:
                 raise Dataset.OutOfRangeError()
-            valid = v if valid is None else valid.intersect(v)
+            valid = val_range if valid is None else valid.intersect(val_range)
         assert valid is not None
         return valid
 

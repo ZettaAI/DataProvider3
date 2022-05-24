@@ -1,3 +1,4 @@
+import copy
 import math
 import numpy as np
 
@@ -12,7 +13,7 @@ class ForwardScanner(object):
     def __init__(self, dataset, scan_spec, **params):
         self._init()
         self.dataset = dataset
-        self.scan_spec = dict(scan_spec)
+        self.scan_spec = copy.deepcopy(scan_spec)
         self.params = params
         self._setup()
 
@@ -75,7 +76,7 @@ class ForwardScanner(object):
     def _setup_stride(self):
         stride = None
         for k, v in self.scan_spec.items():
-            box = centered_box(Vec3d(0,0,0), v[-3:])
+            box = centered_box(Vec3d(0,0,0), v['shape'][-3:])
             stride = box if stride is None else stride.intersect(box)
         assert(stride is not None)
         self.default_stride = stride.size()
