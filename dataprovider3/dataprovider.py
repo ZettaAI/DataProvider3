@@ -12,11 +12,12 @@ class DataProvider(object):
         augs (Augment): Augment.
         p (list of float): sampling weights.
     """
-    def __init__(self, spec):
+    def __init__(self, spec, out_of_range_limit=10_000):
         self.spec = dict(spec)
         self.datasets = list()
         self.augments = None
         self.p = None
+        self.out_of_range_limit = out_of_range_limit
 
     def add_dataset(self, dset):
         assert isinstance(dset, Dataset)
@@ -51,6 +52,7 @@ class DataProvider(object):
 
     def random_sample(self):
         dset = self.random_dataset()
+        out_of_range_count = 0  # Out-of-range error count
         while True:
             try:
                 spec = dict(self.spec)
@@ -63,7 +65,10 @@ class DataProvider(object):
                     sample = self.augments(dset(spec=spec))
                 break
             except Dataset.OutOfRangeError:
-                pass
+                out_of_range_count += 1
+                if out_of_range_count < self.out_of_range_limit:
+                    continue
+                raise
             except:
                 raise
         return sample
