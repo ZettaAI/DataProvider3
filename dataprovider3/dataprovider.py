@@ -43,15 +43,17 @@ class DataProvider(object):
         assert len(p)==len(self.datasets)
         self.p = p
 
-    def random_dataset(self):
+    def random_dataset_idx(self):
         assert len(self.datasets) > 0
         if self.p is None:
             self.set_sampling_weights()
-        idx = np.random.choice(len(self.datasets), size=1, p=self.p)
-        return self.datasets[idx[0]]
+        return np.random.choice(len(self.datasets), size=1, p=self.p)[0]
 
-    def random_sample(self):
-        dset = self.random_dataset()
+    def random_dataset(self):
+        return self.datasets[self.random_dataset_idx()]
+
+    def random_sample(self, idx=None):
+        dset = self.random_dataset() if idx is None else self.datasets[idx]
         out_of_range_count = 0  # Out-of-range error count
         while True:
             try:
