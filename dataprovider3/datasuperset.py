@@ -31,8 +31,8 @@ class DataSuperset(Dataset):
         assert isinstance(dset, Dataset)
         self.datasets.append(dset)
 
-    def random_sample(self, spec=None):
-        dset = self.random_dataset()
+    def random_sample(self, spec=None, idx=None):
+        dset = self.random_dataset() if idx is None else self.datasets[idx]
         return dset(spec=spec)
 
     def set_sampling_weights(self, p=None):
@@ -43,12 +43,14 @@ class DataSuperset(Dataset):
         assert len(p)==len(self.datasets)
         self.p = p
 
-    def random_dataset(self):
+    def random_dataset_idx(self):
         assert len(self.datasets) > 0
         if self.p is None:
             self.set_sampling_weights()
-        idx = np.random.choice(len(self.datasets), size=1, p=self.p)
-        return self.datasets[idx[0]]
+        return np.random.choice(len(self.datasets), size=1, p=self.p)[0]
+
+    def random_dataset(self):
+        return self.datasets[self.random_dataset_idx()]
 
     def num_samples(self, spec=None):
         return sum([dset.num_samples(spec=spec) for dset in self.datasets])
