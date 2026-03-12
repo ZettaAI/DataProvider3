@@ -39,10 +39,14 @@ class Dataset(object):
     def add_mask(self, key, data, offset=(0,0,0), loc=False):
         self.add_data(key, data, offset=offset)
         if loc:
-            self.locs = dict()
-            self.locs['data'] = np.flatnonzero(data)
-            self.locs['dims'] = data.shape
-            self.locs['offset'] = Vec3d(offset)
+            new_locs = np.flatnonzero(data)
+            if self.locs is None:
+                self.locs = dict()
+                self.locs['data'] = new_locs
+                self.locs['dims'] = data.shape
+                self.locs['offset'] = Vec3d(offset)
+            else:
+                self.locs['data'] = np.union1d(self.locs['data'], new_locs)
 
     def set_spec(self, spec):
         self.spec = None
