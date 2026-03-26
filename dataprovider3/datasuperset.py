@@ -16,9 +16,13 @@ class DataSuperset(Dataset):
         return self.random_sample(spec=spec)
 
     def __repr__(self):
+        if self.p is None and self.datasets:
+            self.set_sampling_weights()
         format_string = self.__class__.__name__ + '('
         format_string += self.tag
-        format_string += ')'
+        for i, dset in enumerate(self.datasets):
+            format_string += '\n        {0:.3f} : {1}'.format(self.p[i], dset)
+        format_string += '\n    )'
         return format_string
 
     def sanity_check(self, spec):
