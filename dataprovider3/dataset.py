@@ -40,8 +40,8 @@ class Dataset(object):
         self.add_data(key, data, offset=offset)
         if loc:
             self.locs = dict()
-            self.locs['data'] = np.flatnonzero(data)
-            self.locs['dims'] = data.shape
+            self.locs['key'] = key
+            self.locs['count'] = int(np.count_nonzero(data))
             self.locs['offset'] = Vec3d(offset)
 
     def set_spec(self, spec):
@@ -86,7 +86,7 @@ class Dataset(object):
                 valid = self._valid_range(spec)
                 num = np.prod(valid.size())
             else:
-                num = self.locs['data'].size
+                num = self.locs['count']
         except Dataset.NoSpecError:
             nums = list()
             for k, v in self.data.items():
@@ -123,12 +123,22 @@ class Dataset(object):
             # Global coordinate system.
             loc = Vec3d(z,y,x) + valid.min()
         else:
+            # Rejection sampling: pick a random location in the valid range
+            # and check the mask. For masks with high nonzero fraction this
+            # converges in very few iterations. Avoids storing a huge index
+            # array (np.flatnonzero) which costs O(nnz * 8) bytes.
+            mask_data = self.data[self.locs['key']]
+            offset = self.locs['offset']
+            s = tuple(valid.size())
             while True:
-                idx = np.random.choice(self.locs['data'], 1)
-                loc = np.unravel_index(idx[0], self.locs['dims'])
-                # Global coordinate system.
-                loc = Vec3d(loc[-3:]) + self.locs['offset']
-                if valid.contains(loc):
+                x = np.random.randint(0, s[-1])
+                y = np.random.randint(0, s[-2])
+                z = np.random.randint(0, s[-3])
+                loc = Vec3d(z, y, x) + valid.min()
+                # Check mask value at this location
+                local = loc - offset
+                val = mask_data._data[..., local[0], local[1], local[2]]
+                if np.any(val > 0):
                     break
         # DEBUG:
         # print('loc = {}'.format(loc))
