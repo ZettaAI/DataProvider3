@@ -15,8 +15,8 @@ class Dataset(object):
         data (dict): mapping key to TensorData.
         locs (dict): valid locations. Either a bounding box the sampler draws
             from and rejects against the mask ('box'), or an explicit array of
-            flat nonzero indices ('data') for masks too sparse to hit by
-            chance. See add_mask.
+            flat nonzero indices ('data') for masks small enough to list
+            outright. See add_mask.
     """
 
     # A location mask is described one of two ways, decided once when the mask
@@ -96,8 +96,8 @@ class Dataset(object):
         """Summarize a mask's sampleable region without listing its indices.
 
         Records the nonzero count and bounding box, both of which come from
-        streaming reductions that allocate nothing of consequence. Masks too
-        sparse for rejection sampling get the historical index array here.
+        streaming reductions that allocate nothing of consequence. Masks whose
+        index array fits the byte budget get that array here instead.
         """
         locs = dict(keys=[key], array=data, dims=data.shape,
                     offset=Vec3d(offset), data=None, box=None, count=0)
