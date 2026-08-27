@@ -7,6 +7,7 @@ them.
 
 Run: python test/test_locs.py
 """
+import contextlib
 import unittest
 
 import numpy as np
@@ -16,6 +17,22 @@ from dataprovider3.geometry import Vec3d
 
 
 SEED = 20260827
+
+
+@contextlib.contextmanager
+def force_box():
+    """Make Dataset prefer the bounding box regardless of mask size.
+
+    Real masks reach the box path by being too big for an index array; test
+    masks are small on purpose, so lower the bar instead of allocating 64 MiB
+    of them.
+    """
+    saved = Dataset.LOC_INDEX_MAX_BYTES
+    Dataset.LOC_INDEX_MAX_BYTES = 0
+    try:
+        yield
+    finally:
+        Dataset.LOC_INDEX_MAX_BYTES = saved
 
 
 def make_dataset(mask, fov, offset=(0, 0, 0)):
@@ -40,8 +57,12 @@ def expected_support(ds, mask, spec, offset=(0, 0, 0)):
 
 
 def draw(ds, spec, n, seed=SEED):
+    state = np.random.get_state()
     np.random.seed(seed)
-    return [tuple(ds._random_location(spec)) for _ in range(n)]
+    try:
+        return [tuple(ds._random_location(spec)) for _ in range(n)]
+    finally:
+        np.random.set_state(state)
 
 
 def box_mask(shape, lo, hi):
@@ -53,7 +74,8 @@ def box_mask(shape, lo, hi):
 class TestRepresentation(unittest.TestCase):
     def test_solid_box_uses_rejection(self):
         mask = box_mask((32,) * 3, 6, 26)
-        ds, _ = make_dataset(mask, 8)
+        with force_box():
+            ds, _ = make_dataset(mask, 8)
         self.assertIsNone(ds.locs["data"], "solid box should not build an index array")
         self.assertIsNotNone(ds.locs["box"])
         self.assertEqual(ds.locs["count"], 20 ** 3)
@@ -65,13 +87,22 @@ class TestRepresentation(unittest.TestCase):
         ds, _ = make_dataset(mask, 8)
         self.assertEqual(ds.num_samples(), int(np.count_nonzero(mask)))
 
+    def test_small_mask_prefers_the_index_array(self):
+        """Below LOC_INDEX_MAX_BYTES the array costs nothing; prefer exactness."""
+        mask = box_mask((32,) * 3, 6, 26)
+        ds, _ = make_dataset(mask, 8)   # no force_box
+        self.assertIsNotNone(ds.locs["data"])
+        self.assertIsNone(ds.locs["box"])
+        self.assertEqual(ds.locs["count"], 20 ** 3)
+
     def test_sparse_mask_falls_back_to_index_array(self):
         rng = np.random.RandomState(0)
         mask = np.zeros((32,) * 3, dtype="uint8")
         # ~1% fill spread over the whole volume -> below REJECT_MIN_FILL
         flat = rng.choice(mask.size, size=mask.size // 100, replace=False)
         mask.ravel()[flat] = 1
-        ds, _ = make_dataset(mask, 8)
+        with force_box():          # even with size out of the way, sparsity wins
+            ds, _ = make_dataset(mask, 8)
         self.assertIsNotNone(ds.locs["data"], "sparse mask should use the index array")
         self.assertIsNone(ds.locs["box"])
         self.assertEqual(ds.locs["count"], int(np.count_nonzero(mask)))
@@ -101,7 +132,8 @@ class TestDistribution(unittest.TestCase):
         return counts
 
     def _compare_paths(self, mask, fov, n=120000, offset=(0, 0, 0)):
-        ds_a, spec = make_dataset(mask, fov, offset)
+        with force_box():
+            ds_a, spec = make_dataset(mask, fov, offset)
         self.assertIsNone(ds_a.locs["data"], "path A must be the rejection path")
         support = expected_support(ds_a, mask, spec, offset)
         a = draw(ds_a, spec, n)
@@ -125,8 +157,9 @@ class TestDistribution(unittest.TestCase):
     def test_box_with_holes_matches_index_array(self):
         """Dense but not a box: rejection must still never return a hole."""
         mask = box_mask((28,) * 3, 6, 22)
-        mask[10:13, 10:13, 10:13] = 0          # carve a hole, fill stays ~0.96
-        ds, _ = make_dataset(mask, 8)
+        mask[10:13, 10:13, 10:13] = 0          # carve a hole; fill stays 0.993
+        with force_box():
+            ds, _ = make_dataset(mask, 8)
         self.assertIsNone(ds.locs["data"], "should still use rejection")
         support = self._compare_paths(mask, 8)
         for p in [(11, 11, 11), (12, 12, 12)]:
@@ -140,13 +173,123 @@ class TestDistribution(unittest.TestCase):
         """Nonzero region sticking out past valid must be clipped, not sampled."""
         mask = np.zeros((28,) * 3, dtype="uint8")
         mask[0:22, 0:22, 0:22] = 1             # reaches the array border
-        ds, spec = make_dataset(mask, 8)
+        with force_box():
+            ds, spec = make_dataset(mask, 8)
         self.assertIsNone(ds.locs["data"])
         support = expected_support(ds, mask, spec)
         valid = ds.valid_range(spec)
         self.assertEqual(tuple(valid.min()), (4, 4, 4))
         for s in draw(ds, spec, 20000):
             self.assertIn(s, support)
+
+
+class TestRareSupport(unittest.TestCase):
+    """Locations that are real but hard to hit must still be served.
+
+    The loop this code replaced was unbounded: it always eventually found a
+    location when one existed. A fixed draw budget alone would turn that into a
+    spurious OutOfRangeError, so the index path resolves the tail exactly.
+    """
+
+    def _rare_mask(self, n=64, margin_slabs=2):
+        # Almost all the mass sits in the fov margin; a handful of voxels are
+        # reachable. Ratio here is ~8 / 16k.
+        mask = np.zeros((n,) * 3, dtype="uint8")
+        mask[0:margin_slabs, :, :] = 1
+        c = n // 2
+        mask[c:c + 2, c:c + 2, c:c + 2] = 1
+        return mask
+
+    def test_rare_support_is_found_not_raised(self):
+        mask = self._rare_mask()
+        ds, spec = make_dataset(mask, 9)
+        self.assertIsNotNone(ds.locs["data"])
+        support = expected_support(ds, mask, spec)
+        self.assertTrue(0 < len(support) <= 64, f"support {len(support)}")
+
+        # far more calls than LOC_RETRY_LIMIT makes likely to succeed by luck
+        for _ in range(300):
+            loc = tuple(ds._random_location(spec))
+            self.assertIn(loc, support)
+
+    def test_scan_fallback_is_uniform(self):
+        mask = self._rare_mask()
+        ds, spec = make_dataset(mask, 9)
+        valid = ds.valid_range(spec)
+        support = expected_support(ds, mask, spec)
+        counts = {}
+        for _ in range(4000):
+            loc = tuple(ds._scan_location(valid))
+            self.assertIn(loc, support)
+            counts[loc] = counts.get(loc, 0) + 1
+        self.assertEqual(set(counts), support, "scan must reach every location")
+        exp = 4000 / len(support)
+        sd = (4000 * (1 / len(support)) * (1 - 1 / len(support))) ** 0.5
+        worst = max(abs(c - exp) for c in counts.values())
+        self.assertLess(worst / sd, 5.0)
+
+
+class TestAnisotropic(unittest.TestCase):
+    """Cubic shapes hide axis transpositions; these do not."""
+
+    def test_anisotropic_mask_and_fov(self):
+        shape, lo, hi = (20, 34, 48), (3, 5, 7), (17, 29, 41)
+        mask = np.zeros(shape, dtype="uint8")
+        mask[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = 1
+        img = np.zeros(shape, dtype="float32")
+        fov = (5, 9, 13)
+
+        def build(force):
+            ds = Dataset(tag="t")
+            ds.add_data("input", img)
+            ds.add_mask("m", mask, loc=True)
+            spec = {"input": (1,) + fov, "m": (1,) + fov}
+            ds.set_spec(spec)
+            return ds, spec
+
+        with force_box():
+            ds_box, spec = build(True)
+        self.assertIsNone(ds_box.locs["data"])
+        self.assertEqual(tuple(ds_box.locs["box"].min()), lo)
+        self.assertEqual(tuple(ds_box.locs["box"].max()), hi)
+
+        ds_idx, _ = build(False)
+        self.assertIsNotNone(ds_idx.locs["data"])
+
+        support = expected_support(ds_box, mask, spec)
+        for s_ in draw(ds_box, spec, 8000):
+            self.assertIn(s_, support)
+        for s_ in draw(ds_idx, spec, 8000, seed=SEED + 7):
+            self.assertIn(s_, support)
+
+
+class TestCrossRepresentation(unittest.TestCase):
+    """Compare the two representations against each other, not just to uniform."""
+
+    def test_frequencies_agree_between_paths(self):
+        mask = box_mask((26,) * 3, 5, 19)
+        mask[8:11, 8:11, 8:11] = 0                     # not a plain box
+        with force_box():
+            ds_box, spec = make_dataset(mask, 8)
+        ds_idx, spec_idx = make_dataset(mask, 8)
+        self.assertIsNone(ds_box.locs["data"])
+        self.assertIsNotNone(ds_idx.locs["data"])
+
+        n = 150000
+        a = draw(ds_box, spec, n, seed=SEED)
+        b = draw(ds_idx, spec_idx, n, seed=SEED + 1)
+        ca, cb = {}, {}
+        for s_ in a:
+            ca[s_] = ca.get(s_, 0) + 1
+        for s_ in b:
+            cb[s_] = cb.get(s_, 0) + 1
+        self.assertEqual(set(ca), set(cb), "the two paths cover different supports")
+
+        # total variation distance should sit at the sampling-noise floor
+        tv = 0.5 * sum(abs(ca.get(k, 0) - cb.get(k, 0)) for k in set(ca) | set(cb)) / n
+        floor = (len(ca) / (np.pi * n)) ** 0.5
+        self.assertLess(tv, 2.0 * floor,
+                        f"TV {tv:.4f} vs chance floor {floor:.4f}")
 
 
 class TestUnion(unittest.TestCase):
@@ -169,8 +312,9 @@ class TestUnion(unittest.TestCase):
         ds = Dataset(tag="t")
         ds.add_data("input", img)
         ds.add_mask("a", box_mask((28,) * 3, 4, 16), loc=True)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             ds.add_mask("b", box_mask((20,) * 3, 4, 16), loc=True)
+        self.assertNotIn("b", ds.data, "a rejected mask must leave nothing behind")
 
 
 class TestTermination(unittest.TestCase):
@@ -178,7 +322,9 @@ class TestTermination(unittest.TestCase):
         """Previously an unbounded `while True`."""
         mask = np.zeros((40,) * 3, dtype="uint8")
         mask[0:3, 0:3, 0:3] = 1                # entirely inside the fov margin
-        ds, spec = make_dataset(mask, 16)
+        with force_box():
+            ds, spec = make_dataset(mask, 16)
+        self.assertIsNone(ds.locs["data"])
         valid = ds.valid_range(spec)
         self.assertFalse(valid.contains(Vec3d(2, 2, 2)))
         with self.assertRaises(Dataset.OutOfRangeError):
@@ -188,7 +334,6 @@ class TestTermination(unittest.TestCase):
         mask = np.zeros((40,) * 3, dtype="uint8")
         mask[0:3, 0:3, 0:3] = 1
         ds, spec = make_dataset(mask, 16)
-        ds._materialize_locs()
         with self.assertRaises(Dataset.OutOfRangeError):
             ds._random_location(spec)
 

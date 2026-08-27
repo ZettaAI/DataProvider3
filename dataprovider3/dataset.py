@@ -19,21 +19,28 @@ class Dataset(object):
             chance. See add_mask.
     """
 
-    # A mask whose nonzero voxels fill at least this fraction of its bounding
-    # box is sampled by rejection: draw from the box, keep the draw if it lands
-    # on a nonzero voxel. Expected draws is ~1/fill. Below the threshold we
-    # store the nonzero indices instead -- which costs little precisely because
-    # a sparse mask has few of them.
+    # A location mask is described one of two ways, decided once when the mask
+    # is registered and never revised afterwards. Deciding eagerly is the whole
+    # point: DataLoader workers fork after the Datasets are built, so anything
+    # allocated later is private to a worker and multiplies by the worker count
+    # -- the opposite of what this representation is for.
+    #
+    # The index array is used whenever it is small enough not to matter, and
+    # for masks too sparse for rejection to converge. Otherwise the mask is
+    # described by its bounding box, which is what keeps a dense mask over a
+    # large volume from costing 8 bytes per nonzero voxel.
+    LOC_INDEX_MAX_BYTES = 64 * 2**20
     REJECT_MIN_FILL = 0.05
 
-    # `count` is measured over the whole mask while the draw comes from
-    # box & valid, so the acceptance estimate can be optimistic. Give up after
-    # this many draws and switch to the index array; falling back is sound.
-    REJECT_LIMIT = 512
+    # Draw budgets. The box path only ever serves masks filling at least
+    # REJECT_MIN_FILL of their bounding box, so exhausting it means the part of
+    # the mask inside `valid` is empty, not merely rare.
+    REJECT_LIMIT = 10000
+    LOC_RETRY_LIMIT = 1000
 
-    # The index array has no further fallback, so it retries far longer before
-    # declaring the location set unreachable.
-    LOC_RETRY_LIMIT = 10000
+    # Above this many nonzeros, resolving the valid subset exactly costs more
+    # than it saves; see _scan_location.
+    LOC_SCAN_MAX = 2**21
 
     def __init__(self, spec=None, tag=''):
         self.set_spec(spec)
@@ -57,19 +64,29 @@ class Dataset(object):
         self.data[key] = TensorData(data, offset=offset)
 
     def add_mask(self, key, data, offset=(0,0,0), loc=False):
+        if loc and self.locs is not None:
+            # A second location mask. Its indices are unraveled against the
+            # first mask's dims and translated by the first mask's offset, so
+            # both must match or the resulting coordinates are silently wrong.
+            # Checked before add_data so a rejected mask leaves nothing behind.
+            if data.shape != self.locs['dims']:
+                raise ValueError(
+                    "location masks must share a shape: "
+                    f"{data.shape} vs {self.locs['dims']}")
+            if Vec3d(offset) != self.locs['offset']:
+                raise ValueError(
+                    "location masks must share an offset: "
+                    f"{tuple(Vec3d(offset))} vs {tuple(self.locs['offset'])}")
+
         self.add_data(key, data, offset=offset)
+
         if loc:
             if self.locs is None:
                 self.locs = self._describe_locs(key, data, offset)
             else:
-                # A second location mask. The union of two nonzero sets is not
-                # a box in general, so drop to the explicit index array -- the
-                # only representation that unions exactly.
-                assert data.shape == self.locs['dims'], (
-                    "location masks must share a shape: "
-                    f"{data.shape} vs {self.locs['dims']}")
-                assert Vec3d(offset) == self.locs['offset'], (
-                    "location masks must share an offset")
+                # The union of two nonzero sets is not a box in general, so
+                # drop to the explicit index array -- the only representation
+                # that unions exactly.
                 self._materialize_locs()
                 self.locs['data'] = np.union1d(self.locs['data'],
                                                np.flatnonzero(data))
@@ -95,7 +112,10 @@ class Dataset(object):
         count = int(np.count_nonzero(data))
         locs['count'] = count
         if count == 0:
-            return locs  # no locations at all; box stays None
+            # No locations at all. Keep the empty index array so the sampling
+            # path has something to report OutOfRangeError from.
+            locs['data'] = np.flatnonzero(data)
+            return locs
 
         bounds = []
         for axis in range(3):
@@ -105,9 +125,13 @@ class Dataset(object):
         box = Box(Vec3d(*[lo for lo, _ in bounds]),
                   Vec3d(*[hi for _, hi in bounds]))
 
-        if count < Dataset.REJECT_MIN_FILL * np.prod(box.size()):
-            # Sparse: rejection would need ~1/fill draws, and the index array
-            # is cheap here anyway.
+        small = count * 8 <= Dataset.LOC_INDEX_MAX_BYTES
+        sparse = count < Dataset.REJECT_MIN_FILL * np.prod(box.size())
+        if small or sparse:
+            # Small enough not to matter, or too sparse for rejection to
+            # converge. Either way the array is built here, before any fork,
+            # so workers share it instead of each allocating its own. `sparse`
+            # alone is not enough: 4.9% of a huge bounding box is still GiBs.
             locs['data'] = np.flatnonzero(data)
             return locs
 
@@ -200,13 +224,8 @@ class Dataset(object):
         valid = self._valid_range(spec)
         if self.locs is None:
             return self._uniform_location(valid)
-        if self.locs['data'] is None:
-            loc = self._rejection_location(valid)
-            if loc is not None:
-                return loc
-            # Not converging: the acceptance estimate was optimistic. Switch
-            # representation permanently rather than keep spinning.
-            self._materialize_locs()
+        if self.locs['box'] is not None:
+            return self._rejection_location(valid)
         return self._indexed_location(valid)
 
     def _uniform_location(self, box):
@@ -226,11 +245,11 @@ class Dataset(object):
         `box & valid` leaves the accepted set -- and therefore the sampling
         distribution -- unchanged, while removing the need for an index array.
         A solid-box mask fills its own bounding box, so nothing is ever
-        rejected. Returns None if the draws are not converging.
+        rejected.
         """
+        assert len(self.locs['keys']) == 1, (
+            "the box describes a single mask; a union forces the index array")
         box = self.locs['box']
-        if box is None:
-            return None
         region = box.intersect(valid)
         if region is None:
             raise Dataset.OutOfRangeError()
@@ -239,20 +258,49 @@ class Dataset(object):
             loc = self._uniform_location(region)
             if mask.is_nonzero_at(loc):
                 return loc
-        return None
+        # This path only serves masks filling >= REJECT_MIN_FILL of their box,
+        # so this many misses means the mask has (near enough) nothing inside
+        # `valid`, not that we were unlucky.
+        raise Dataset.OutOfRangeError()
 
     def _indexed_location(self, valid):
         """Draw a nonzero voxel, keep it if the whole patch fits."""
-        if self.locs['data'].size == 0:
+        data = self.locs['data']
+        if data.size == 0:
             raise Dataset.OutOfRangeError()
         for _ in range(Dataset.LOC_RETRY_LIMIT):
-            idx = np.random.choice(self.locs['data'], 1)
+            idx = np.random.choice(data, 1)
             loc = np.unravel_index(idx[0], self.locs['dims'])
             # Global coordinate system.
             loc = Vec3d(loc[-3:]) + self.locs['offset']
             if valid.contains(loc):
                 return loc
-        raise Dataset.OutOfRangeError()
+        return self._scan_location(valid)
+
+    def _scan_location(self, valid):
+        """Resolve the locations inside `valid` exactly, in one pass.
+
+        Random retries can miss a support that is real but rare, and simply
+        giving up after a fixed number of draws would raise on inputs the
+        unbounded loop this replaced always served. So settle it exactly rather
+        than probabilistically: this either returns a location or proves none
+        exists.
+        """
+        data = self.locs['data']
+        if data.size > Dataset.LOC_SCAN_MAX:
+            # Scanning would cost more than the draws already spent.
+            raise Dataset.OutOfRangeError()
+        coords = np.unravel_index(data, self.locs['dims'])
+        offset, lo, hi = self.locs['offset'], valid.min(), valid.max()
+        inside = np.ones(data.size, dtype=bool)
+        for i in range(3):
+            c = coords[i - 3] + offset[i]
+            inside &= (c >= lo[i]) & (c < hi[i])
+        hits = np.flatnonzero(inside)
+        if hits.size == 0:
+            raise Dataset.OutOfRangeError()
+        pick = hits[np.random.randint(0, hits.size)]
+        return Vec3d(*[int(coords[i - 3][pick]) + offset[i] for i in range(3)])
 
     def _valid_range(self, spec):
         """Compute the valid range, which is intersection of the valid range
