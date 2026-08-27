@@ -25,22 +25,21 @@ class Dataset(object):
     # allocated later is private to a worker and multiplies by the worker count
     # -- the opposite of what this representation is for.
     #
-    # The index array is used whenever it is small enough not to matter, and
-    # for masks too sparse for rejection to converge. Otherwise the mask is
-    # described by its bounding box, which is what keeps a dense mask over a
-    # large volume from costing 8 bytes per nonzero voxel.
+    # The index array is exact and cheap to draw from, so it is used whenever
+    # it fits in this budget. Past it, the mask is described by its bounding
+    # box and sampled by rejection, which costs nothing per nonzero voxel.
+    # A mask big enough to land on the box path is also dense enough for
+    # rejection to converge: filling less than ~0.1% of a bounding box that
+    # already holds 8M nonzero voxels would take a volume of ~2000^3.
     LOC_INDEX_MAX_BYTES = 64 * 2**20
-    REJECT_MIN_FILL = 0.05
 
-    # Draw budgets. The box path only ever serves masks filling at least
-    # REJECT_MIN_FILL of their bounding box, so exhausting it means the part of
-    # the mask inside `valid` is empty, not merely rare.
+    # Draw budgets before a location is declared unreachable.
     REJECT_LIMIT = 10000
     LOC_RETRY_LIMIT = 1000
 
-    # Above this many nonzeros, resolving the valid subset exactly costs more
-    # than it saves; see _scan_location.
-    LOC_SCAN_MAX = 2**21
+    # Index chunk size for the exact scan; bounds its working set regardless of
+    # how many nonzero voxels the mask has.
+    LOC_SCAN_CHUNK = 2**18
 
     def __init__(self, spec=None, tag=''):
         self.set_spec(spec)
@@ -125,13 +124,9 @@ class Dataset(object):
         box = Box(Vec3d(*[lo for lo, _ in bounds]),
                   Vec3d(*[hi for _, hi in bounds]))
 
-        small = count * 8 <= Dataset.LOC_INDEX_MAX_BYTES
-        sparse = count < Dataset.REJECT_MIN_FILL * np.prod(box.size())
-        if small or sparse:
-            # Small enough not to matter, or too sparse for rejection to
-            # converge. Either way the array is built here, before any fork,
-            # so workers share it instead of each allocating its own. `sparse`
-            # alone is not enough: 4.9% of a huge bounding box is still GiBs.
+        if count * 8 <= Dataset.LOC_INDEX_MAX_BYTES:
+            # Small enough that exactness is free. Built here, before any fork,
+            # so workers share one copy instead of each allocating its own.
             locs['data'] = np.flatnonzero(data)
             return locs
 
@@ -258,9 +253,9 @@ class Dataset(object):
             loc = self._uniform_location(region)
             if mask.is_nonzero_at(loc):
                 return loc
-        # This path only serves masks filling >= REJECT_MIN_FILL of their box,
-        # so this many misses means the mask has (near enough) nothing inside
-        # `valid`, not that we were unlucky.
+        # This path only serves masks with millions of nonzero voxels, so this
+        # many consecutive misses means the part inside `valid` is empty or
+        # vanishingly small, not that we were unlucky.
         raise Dataset.OutOfRangeError()
 
     def _indexed_location(self, valid):
@@ -280,27 +275,42 @@ class Dataset(object):
     def _scan_location(self, valid):
         """Resolve the locations inside `valid` exactly, in one pass.
 
-        Random retries can miss a support that is real but rare, and simply
-        giving up after a fixed number of draws would raise on inputs the
-        unbounded loop this replaced always served. So settle it exactly rather
-        than probabilistically: this either returns a location or proves none
+        Random retries can miss a support that is real but rare, and giving up
+        after a fixed number of draws would raise on inputs the unbounded loop
+        this replaced always served. So settle it exactly rather than
+        probabilistically: this either returns a location or proves none
         exists.
+
+        The pass walks the index array in chunks and keeps a single reservoir
+        sample, so its working set does not grow with the number of nonzero
+        voxels -- it runs after a fork, where allocating proportionally to the
+        mask would defeat the purpose of the box representation.
         """
         data = self.locs['data']
-        if data.size > Dataset.LOC_SCAN_MAX:
-            # Scanning would cost more than the draws already spent.
-            raise Dataset.OutOfRangeError()
-        coords = np.unravel_index(data, self.locs['dims'])
+        dims = self.locs['dims']
         offset, lo, hi = self.locs['offset'], valid.min(), valid.max()
-        inside = np.ones(data.size, dtype=bool)
-        for i in range(3):
-            c = coords[i - 3] + offset[i]
-            inside &= (c >= lo[i]) & (c < hi[i])
-        hits = np.flatnonzero(inside)
-        if hits.size == 0:
+
+        chosen, seen = None, 0
+        for start in range(0, data.size, Dataset.LOC_SCAN_CHUNK):
+            block = data[start:start + Dataset.LOC_SCAN_CHUNK]
+            coords = np.unravel_index(block, dims)
+            inside = np.ones(block.size, dtype=bool)
+            for i in range(3):
+                c = coords[i - 3] + offset[i]
+                inside &= (c >= lo[i]) & (c < hi[i])
+            hits = np.flatnonzero(inside)
+            if hits.size == 0:
+                continue
+            seen += hits.size
+            # Replace with probability hits.size/seen, which leaves `chosen`
+            # uniform over every location found so far.
+            if np.random.randint(0, seen) < hits.size:
+                pick = hits[np.random.randint(0, hits.size)]
+                chosen = tuple(int(coords[i - 3][pick]) + offset[i]
+                               for i in range(3))
+        if chosen is None:
             raise Dataset.OutOfRangeError()
-        pick = hits[np.random.randint(0, hits.size)]
-        return Vec3d(*[int(coords[i - 3][pick]) + offset[i] for i in range(3)])
+        return Vec3d(*chosen)
 
     def _valid_range(self, spec):
         """Compute the valid range, which is intersection of the valid range

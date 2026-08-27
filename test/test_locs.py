@@ -95,17 +95,36 @@ class TestRepresentation(unittest.TestCase):
         self.assertIsNone(ds.locs["box"])
         self.assertEqual(ds.locs["count"], 20 ** 3)
 
-    def test_sparse_mask_falls_back_to_index_array(self):
+    def test_real_policy_picks_the_box_for_a_large_mask(self):
+        """The shipped threshold, not force_box(), must reach the box path."""
+        n = 210                       # 210^3 = 9.26M nonzeros > 64 MiB / 8
+        mask = np.ones((n,) * 3, dtype="uint8")
+        img = np.zeros(mask.shape, dtype="float32")
+        ds = Dataset(tag="t")
+        ds.add_data("input", img)
+        ds.add_mask("m", mask, loc=True)
+        spec = {"input": (1,) + (8,) * 3, "m": (1,) + (8,) * 3}
+        ds.set_spec(spec)
+
+        self.assertGreater(ds.locs["count"] * 8, Dataset.LOC_INDEX_MAX_BYTES)
+        self.assertIsNone(ds.locs["data"], "large mask must not build an index array")
+        self.assertIsNotNone(ds.locs["box"])
+        valid = ds.valid_range(spec)
+        for loc in draw(ds, spec, 2000):
+            self.assertTrue(valid.contains(Vec3d(loc)))
+
+    def test_rejection_converges_on_a_sparse_mask(self):
+        """Low fill costs draws, not correctness."""
         rng = np.random.RandomState(0)
         mask = np.zeros((32,) * 3, dtype="uint8")
-        # ~1% fill spread over the whole volume -> below REJECT_MIN_FILL
         flat = rng.choice(mask.size, size=mask.size // 100, replace=False)
         mask.ravel()[flat] = 1
-        with force_box():          # even with size out of the way, sparsity wins
-            ds, _ = make_dataset(mask, 8)
-        self.assertIsNotNone(ds.locs["data"], "sparse mask should use the index array")
-        self.assertIsNone(ds.locs["box"])
-        self.assertEqual(ds.locs["count"], int(np.count_nonzero(mask)))
+        with force_box():
+            ds, spec = make_dataset(mask, 8)
+        self.assertIsNone(ds.locs["data"])
+        support = expected_support(ds, mask, spec)
+        for loc in draw(ds, spec, 3000):
+            self.assertIn(loc, support)
 
     def test_empty_mask_has_no_locations(self):
         mask = np.zeros((32,) * 3, dtype="uint8")
@@ -315,6 +334,54 @@ class TestUnion(unittest.TestCase):
         with self.assertRaises(ValueError):
             ds.add_mask("b", box_mask((20,) * 3, 4, 16), loc=True)
         self.assertNotIn("b", ds.data, "a rejected mask must leave nothing behind")
+
+
+class TestUnionValidation(unittest.TestCase):
+    def _ds(self):
+        ds = Dataset(tag="t")
+        ds.add_data("input", np.zeros((28,) * 3, dtype="float32"))
+        ds.add_mask("a", box_mask((28,) * 3, 4, 16), loc=True)
+        return ds
+
+    def test_mismatched_offset_is_rejected(self):
+        ds = self._ds()
+        with self.assertRaises(ValueError):
+            ds.add_mask("b", box_mask((28,) * 3, 4, 16), offset=(1, 0, 0), loc=True)
+        self.assertNotIn("b", ds.data, "a rejected mask must leave nothing behind")
+
+    def test_union_after_a_box_representation(self):
+        """A box must convert to an index array when a second mask arrives."""
+        a = box_mask((28,) * 3, 4, 16)
+        b = box_mask((28,) * 3, 12, 24)
+        with force_box():
+            ds = Dataset(tag="t")
+            ds.add_data("input", np.zeros(a.shape, dtype="float32"))
+            ds.add_mask("a", a, loc=True)
+            self.assertIsNone(ds.locs["data"], "first mask should be a box")
+            ds.add_mask("b", b, loc=True)
+        self.assertIsNone(ds.locs["box"], "the union cannot stay a box")
+        expected = np.union1d(np.flatnonzero(a), np.flatnonzero(b))
+        np.testing.assert_array_equal(ds.locs["data"], expected)
+        self.assertEqual(ds.locs["keys"], ["a", "b"])
+
+
+class TestChannelledMask(unittest.TestCase):
+    def test_4d_mask_uses_the_index_array(self):
+        mask = np.zeros((2,) + (24,) * 3, dtype="uint8")
+        mask[:, 5:19, 5:19, 5:19] = 1
+        img = np.zeros((24,) * 3, dtype="float32")
+        with force_box():                       # even so, 4-D cannot be a box
+            ds = Dataset(tag="t")
+            ds.add_data("input", img)
+            ds.add_mask("m", mask, loc=True)
+        self.assertIsNone(ds.locs["box"])
+        self.assertIsNotNone(ds.locs["data"])
+        self.assertEqual(ds.locs["count"], int(np.count_nonzero(mask)))
+        spec = {"input": (1, 8, 8, 8), "m": (1, 8, 8, 8)}
+        ds.set_spec(spec)
+        valid = ds.valid_range(spec)
+        for loc in draw(ds, spec, 2000):
+            self.assertTrue(valid.contains(Vec3d(loc)))
 
 
 class TestTermination(unittest.TestCase):
