@@ -48,6 +48,18 @@ class TensorData(object):
                                            vmin[2]:vmax[2]])
         return patch
 
+    def is_nonzero_at(self, pos):
+        """True if any channel is nonzero at global position `pos`.
+
+        Used by Dataset's rejection sampling to test a candidate location
+        without materializing the mask's nonzero indices.
+        """
+        assert len(pos) == 3
+        if not self._bbox.contains(pos):
+            return False
+        p = Vec3d(pos) - self._offset
+        return bool(np.any(self._data[..., p[0], p[1], p[2]]))
+
     def valid_range(self, dim):
         """Get a valid range for extracting patches of size `dim`."""
         assert(len(dim)==3)
