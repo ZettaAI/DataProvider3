@@ -20,6 +20,21 @@ SEED = 20260827
 
 
 @contextlib.contextmanager
+def small_scan_chunk(n=4096):
+    """Shrink the scan chunk so multi-chunk behaviour is reachable in a test.
+
+    The shipped chunk is 262,144 indices; a mask big enough to span two of them
+    is not worth allocating just to check that the loop advances.
+    """
+    saved = Dataset.LOC_SCAN_CHUNK
+    Dataset.LOC_SCAN_CHUNK = n
+    try:
+        yield
+    finally:
+        Dataset.LOC_SCAN_CHUNK = saved
+
+
+@contextlib.contextmanager
 def force_box():
     """Make Dataset prefer the bounding box regardless of mask size.
 
@@ -314,6 +329,73 @@ class TestBoxPathRareSupport(unittest.TestCase):
         self.assertEqual(len(counts), 4 ** 3, "scan must reach every core voxel")
         exp = 2000 / len(counts)
         sd = (2000 * (1 / len(counts)) * (1 - 1 / len(counts))) ** 0.5
+        self.assertLess(max(abs(c - exp) for c in counts.values()) / sd, 5.0)
+
+
+class TestReservoirWeighting(unittest.TestCase):
+    """Both scans keep a size-1 reservoir across batches of unequal size.
+
+    A reservoir that weighted batches equally instead of by hit count would
+    still pass a test whose batches happen to be the same size, so these make
+    the sizes deliberately lopsided.
+    """
+
+    def test_scan_region_weights_slabs_by_hit_count(self):
+        # z-slabs carrying 1, 60, 1, 200, 1 hits
+        shape = (24, 40, 40)
+        mask = np.zeros(shape, dtype="uint8")
+        plan = {8: 1, 10: 60, 12: 1, 14: 200, 16: 1}
+        for z, k in plan.items():
+            flat = np.arange(k) * 7 % (30 * 30)
+            ys, xs = np.unravel_index(flat, (30, 30))
+            mask[z, ys + 5, xs + 5] = 1
+        total = int(np.count_nonzero(mask))
+
+        img = np.zeros(shape, dtype="float32")
+        with force_box():
+            ds = Dataset(tag="t")
+            ds.add_data("input", img)
+            ds.add_mask("m", mask, loc=True)
+            spec = {"input": (1, 5, 9, 9), "m": (1, 5, 9, 9)}
+            ds.set_spec(spec)
+        region = ds.locs["box"].intersect(ds.valid_range(spec))
+
+        n = 20000
+        per_z = {}
+        for _ in range(n):
+            loc = tuple(ds._scan_region(region))
+            self.assertTrue(mask[loc])
+            per_z[loc[0]] = per_z.get(loc[0], 0) + 1
+
+        # each slab's share must track its hit count, not 1/len(slabs)
+        for z, k in plan.items():
+            exp = n * k / total
+            sd = (n * (k / total) * (1 - k / total)) ** 0.5
+            self.assertLess(abs(per_z.get(z, 0) - exp) / sd, 5.0,
+                            f"slab z={z} got {per_z.get(z, 0)}, expected ~{exp:.0f}")
+
+    def test_scan_location_spans_multiple_chunks(self):
+        """The index array must be walked in chunks, not just the first one."""
+        n = 96
+        mask = np.zeros((n, n, n), dtype="uint8")
+        mask[0:2] = 1                       # bulk, all inside the fov margin
+        mask[48:50, 48:50, 48:50] = 1       # the reachable part
+        ds, spec = make_dataset(mask, 17)
+        self.assertIsNotNone(ds.locs["data"])
+
+        valid = ds.valid_range(spec)
+        support = expected_support(ds, mask, spec)
+        counts = {}
+        with small_scan_chunk(4096):
+            self.assertGreater(ds.locs["data"].size, Dataset.LOC_SCAN_CHUNK * 4,
+                               "index array must span several chunks")
+            for _ in range(3000):
+                loc = tuple(ds._scan_location(valid))
+                self.assertIn(loc, support)
+                counts[loc] = counts.get(loc, 0) + 1
+        self.assertEqual(set(counts), support, "scan must reach every location")
+        exp = 3000 / len(support)
+        sd = (3000 * (1 / len(support)) * (1 - 1 / len(support))) ** 0.5
         self.assertLess(max(abs(c - exp) for c in counts.values()) / sd, 5.0)
 
 

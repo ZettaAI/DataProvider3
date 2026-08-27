@@ -31,13 +31,17 @@ class Dataset(object):
     # box and sampled by rejection, which costs nothing per nonzero voxel.
     #
     # The budget says nothing about how well rejection will converge: `count`
-    # is over the whole mask, while draws are accepted over `box & valid`, so
-    # nonzero mass parked in the fov margin inflates one without helping the
-    # other. Neither path relies on converging -- each resolves the tail with
-    # an exact scan.
+    # is over the whole mask, while draws are accepted over `box & valid`.
+    # Anything that separates the two widens the gap -- nonzero mass sitting in
+    # the fov margin, but equally a hollow shell or two distant blobs entirely
+    # inside `valid`. What bounds the damage is that clearing the budget takes
+    # 8.39M nonzero voxels in a resident mask, so fill >= 8.39e6/volume and the
+    # cost stays under roughly 1 ms per sample per GiB of mask. Correctness
+    # never depends on it: each path resolves the tail with an exact scan.
     LOC_INDEX_MAX_BYTES = 64 * 2**20
 
-    # Draw budgets before a location is declared unreachable.
+    # Draw budgets before each path stops guessing and scans exactly. Neither
+    # declares anything unreachable -- that verdict only ever comes from a scan.
     REJECT_LIMIT = 10000
     LOC_RETRY_LIMIT = 1000
 
@@ -123,6 +127,14 @@ class Dataset(object):
             locs['data'] = np.flatnonzero(data)
             return locs
 
+        if count * 8 <= Dataset.LOC_INDEX_MAX_BYTES:
+            # Small enough that exactness is free. Built here, before any fork,
+            # so workers share one copy instead of each allocating its own.
+            # Decided before the bounding box is computed -- these masks never
+            # use it, and the reductions are three full passes.
+            locs['data'] = np.flatnonzero(data)
+            return locs
+
         bounds = []
         for axis in range(3):
             others = tuple(i for i in range(3) if i != axis)
@@ -130,13 +142,6 @@ class Dataset(object):
             bounds.append((int(hits[0]), int(hits[-1]) + 1))
         box = Box(Vec3d(*[lo for lo, _ in bounds]),
                   Vec3d(*[hi for _, hi in bounds]))
-
-        if count * 8 <= Dataset.LOC_INDEX_MAX_BYTES:
-            # Small enough that exactness is free. Built here, before any fork,
-            # so workers share one copy instead of each allocating its own.
-            locs['data'] = np.flatnonzero(data)
-            return locs
-
         box.translate(locs['offset'])  # global coordinate system
         locs['box'] = box
         return locs
@@ -221,7 +226,9 @@ class Dataset(object):
 
         Every branch yields a location drawn uniformly from
         `nonzero(mask) & valid` (or from `valid` alone when no location mask
-        was registered) -- only the proposal differs.
+        was registered) -- only the proposal differs. For a channelled mask a
+        coordinate nonzero in several channels is drawn proportionally more
+        often, matching what the index array has always done.
         """
         valid = self._valid_range(spec)
         if self.locs is None:
@@ -255,6 +262,10 @@ class Dataset(object):
         region = box.intersect(valid)
         if region is None:
             raise Dataset.OutOfRangeError()
+        if region.volume() <= Dataset.REJECT_LIMIT:
+            # Drawing with replacement more times than the region has voxels
+            # cannot beat enumerating it.
+            return self._scan_region(region)
         mask = self.data[self.locs['keys'][0]]
         for _ in range(Dataset.REJECT_LIMIT):
             loc = self._uniform_location(region)
@@ -274,7 +285,8 @@ class Dataset(object):
         unbounded loop this replaced always returned.
 
         Keeps a reservoir sample across slabs, so the working set is one slab
-        regardless of how large the region is.
+        rather than the whole region -- though a slab still scales with the
+        region's lateral cross-section, unlike _scan_location's fixed chunk.
         """
         array = self.locs['array']
         offset = self.locs['offset']
@@ -323,8 +335,8 @@ class Dataset(object):
 
         The pass walks the index array in chunks and keeps a single reservoir
         sample, so its working set does not grow with the number of nonzero
-        voxels -- it runs after a fork, where allocating proportionally to the
-        mask would defeat the purpose of the box representation.
+        voxels. It runs after a fork, and the obvious one-shot form would
+        allocate three `count`-sized coordinate arrays per call.
         """
         data = self.locs['data']
         dims = self.locs['dims']
