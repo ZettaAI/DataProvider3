@@ -248,6 +248,75 @@ class TestRareSupport(unittest.TestCase):
         self.assertLess(worst / sd, 5.0)
 
 
+class TestBoxPathRareSupport(unittest.TestCase):
+    """The box path must not raise where the index path would have served.
+
+    A mask can clear the byte budget on nonzero voxels that all sit in the fov
+    margin, so `count` says "dense" while acceptance over `box & valid` is
+    near zero. Rejection then exhausts its budget on a mask that does have
+    reachable locations.
+    """
+
+    def _margin_heavy(self, core=8):
+        # z-margin slabs carry the mass; a small core is the only reachable part
+        mask = np.zeros((128, 512, 512), dtype="uint8")
+        mask[0:20] = 1
+        mask[108:] = 1
+        c = 64, 256, 256
+        h = core // 2
+        mask[c[0]-h:c[0]+h, c[1]-h:c[1]+h, c[2]-h:c[2]+h] = 1
+        return mask
+
+    def test_margin_heavy_mask_is_served_not_raised(self):
+        mask = self._margin_heavy()
+        img = np.zeros(mask.shape, dtype="float32")
+        ds = Dataset(tag="t")
+        ds.add_data("input", img)
+        ds.add_mask("m", mask, loc=True)
+        fov = (41, 9, 9)
+        spec = {"input": (1,) + fov, "m": (1,) + fov}
+        ds.set_spec(spec)
+
+        # precondition: over the budget, so the box path is chosen
+        self.assertGreater(ds.locs["count"] * 8, Dataset.LOC_INDEX_MAX_BYTES)
+        self.assertIsNotNone(ds.locs["box"])
+
+        valid = ds.valid_range(spec)
+        raised, seen = 0, set()
+        for _ in range(40):
+            try:
+                loc = tuple(ds._random_location(spec))
+            except Dataset.OutOfRangeError:
+                raised += 1
+                continue
+            self.assertTrue(valid.contains(Vec3d(loc)))
+            self.assertTrue(mask[loc], f"{loc} is not a nonzero mask voxel")
+            seen.add(loc)
+        self.assertEqual(raised, 0, f"raised {raised}/40 on a reachable mask")
+        self.assertGreater(len(seen), 1)
+
+    def test_scan_region_is_uniform(self):
+        mask = self._margin_heavy(core=4)
+        img = np.zeros(mask.shape, dtype="float32")
+        ds = Dataset(tag="t")
+        ds.add_data("input", img)
+        ds.add_mask("m", mask, loc=True)
+        fov = (41, 9, 9)
+        spec = {"input": (1,) + fov, "m": (1,) + fov}
+        ds.set_spec(spec)
+        region = ds.locs["box"].intersect(ds.valid_range(spec))
+
+        counts = {}
+        for _ in range(2000):
+            loc = tuple(ds._scan_region(region))
+            self.assertTrue(mask[loc])
+            counts[loc] = counts.get(loc, 0) + 1
+        self.assertEqual(len(counts), 4 ** 3, "scan must reach every core voxel")
+        exp = 2000 / len(counts)
+        sd = (2000 * (1 / len(counts)) * (1 - 1 / len(counts))) ** 0.5
+        self.assertLess(max(abs(c - exp) for c in counts.values()) / sd, 5.0)
+
+
 class TestAnisotropic(unittest.TestCase):
     """Cubic shapes hide axis transpositions; these do not."""
 

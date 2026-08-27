@@ -20,17 +20,21 @@ class Dataset(object):
     """
 
     # A location mask is described one of two ways, decided once when the mask
-    # is registered and never revised afterwards. Deciding eagerly is the whole
-    # point: DataLoader workers fork after the Datasets are built, so anything
-    # allocated later is private to a worker and multiplies by the worker count
-    # -- the opposite of what this representation is for.
+    # is registered and never revised afterwards. Deciding eagerly matters:
+    # DataLoader workers fork after the Datasets are built. An array allocated
+    # before the fork stays shared (numpy data pages are not touched by
+    # refcounting), but one a worker allocates afterwards is private to it and
+    # multiplies by the worker count.
     #
     # The index array is exact and cheap to draw from, so it is used whenever
     # it fits in this budget. Past it, the mask is described by its bounding
     # box and sampled by rejection, which costs nothing per nonzero voxel.
-    # A mask big enough to land on the box path is also dense enough for
-    # rejection to converge: filling less than ~0.1% of a bounding box that
-    # already holds 8M nonzero voxels would take a volume of ~2000^3.
+    #
+    # The budget says nothing about how well rejection will converge: `count`
+    # is over the whole mask, while draws are accepted over `box & valid`, so
+    # nonzero mass parked in the fov margin inflates one without helping the
+    # other. Neither path relies on converging -- each resolves the tail with
+    # an exact scan.
     LOC_INDEX_MAX_BYTES = 64 * 2**20
 
     # Draw budgets before a location is declared unreachable.
@@ -85,7 +89,10 @@ class Dataset(object):
             else:
                 # The union of two nonzero sets is not a box in general, so
                 # drop to the explicit index array -- the only representation
-                # that unions exactly.
+                # that unions exactly. This forfeits the box representation's
+                # saving entirely, and it is a live configuration rather than a
+                # corner case: DeepEM registers two location masks whenever a
+                # sample carries distinct per-key masks.
                 self._materialize_locs()
                 self.locs['data'] = np.union1d(self.locs['data'],
                                                np.flatnonzero(data))
@@ -253,10 +260,43 @@ class Dataset(object):
             loc = self._uniform_location(region)
             if mask.is_nonzero_at(loc):
                 return loc
-        # This path only serves masks with millions of nonzero voxels, so this
-        # many consecutive misses means the part inside `valid` is empty or
-        # vanishingly small, not that we were unlucky.
-        raise Dataset.OutOfRangeError()
+        # Out of budget. Whether that means "empty" or merely "rare" cannot be
+        # decided by drawing more, so settle it exactly.
+        return self._scan_region(region)
+
+    def _scan_region(self, region):
+        """Find a nonzero mask voxel inside `region` exactly, a slab at a time.
+
+        The counterpart of _scan_location for the box representation. Rejection
+        converges on how much of `region` the mask covers, which the byte
+        budget does not bound -- a mask can clear it on nonzero voxels that all
+        sit outside `valid`. Without this, such a mask would raise where the
+        unbounded loop this replaced always returned.
+
+        Keeps a reservoir sample across slabs, so the working set is one slab
+        regardless of how large the region is.
+        """
+        array = self.locs['array']
+        offset = self.locs['offset']
+        lo = [region.min()[i] - offset[i] for i in range(3)]
+        hi = [region.max()[i] - offset[i] for i in range(3)]
+
+        chosen, seen = None, 0
+        for z in range(lo[0], hi[0]):
+            slab = array[z, lo[1]:hi[1], lo[2]:hi[2]]
+            hits = np.flatnonzero(slab)
+            if hits.size == 0:
+                continue
+            seen += hits.size
+            if np.random.randint(0, seen) < hits.size:
+                pick = hits[np.random.randint(0, hits.size)]
+                y, x = np.unravel_index(pick, slab.shape)
+                chosen = (z + offset[0],
+                          int(y) + lo[1] + offset[1],
+                          int(x) + lo[2] + offset[2])
+        if chosen is None:
+            raise Dataset.OutOfRangeError()
+        return Vec3d(*chosen)
 
     def _indexed_location(self, valid):
         """Draw a nonzero voxel, keep it if the whole patch fits."""
